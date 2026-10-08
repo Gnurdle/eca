@@ -4,6 +4,7 @@
    [clojure.java.io :as io]
    [clojure.string :as string]
    [eca.client-http :as client]
+   [eca.llm-providers.dsml :as dsml]
    [eca.llm-util :as llm-util]
    [eca.logger :as logger]
    [eca.message-sanitize :as message-sanitize]
@@ -70,10 +71,32 @@
                          (assoc :name (:full-name tool)))})
         tools))
 
+(defn- maybe-recover-dsml-tool-calls
+  "DeepSeek-compatible providers (see `eca.llm-providers.dsml`) may return DSML
+  tool-call markup as assistant CONTENT instead of the structured `:tool_calls`
+  field. When that happens, synthesise `:tool_calls` entries in the provider
+  shape so the normal mapping path handles them, and strip the markup from
+  `:content` so it is not shown as prose. Returns `message` unchanged otherwise."
+  [message]
+  (if (seq (:tool_calls message))
+    message
+    (let [{:keys [tool-calls text]} (dsml/extract (:content message))]
+      (if (seq tool-calls)
+        (-> message
+            (assoc :tool_calls
+                   (mapv (fn [{:keys [full-name arguments]}]
+                           {:id (str (random-uuid))
+                            :type "function"
+                            :function {:name full-name
+                                       :arguments (json/generate-string arguments)}})
+                         tool-calls))
+            (assoc :content text))
+        message))))
+
 (defn ^:private response-body->result [{:keys [choices usage]} on-tools-called-wrapper]
   (when (> (count choices) 1)
     (throw (ex-info "Multiple choices in response!" {})))
-  (let [message (-> choices first :message)
+  (let [message (maybe-recover-dsml-tool-calls (-> choices first :message))
         tool-turn-id (when (seq (:tool_calls message)) (str (random-uuid)))
         tools-to-call (->> (:tool_calls message)
                            (map-indexed (fn [idx tool-call]
@@ -647,6 +670,38 @@
                                 :type nil
                                 :content ""
                                 :buffer ""})
+        ;; DSML (DeepSeek): strip tool-call markup from streamed text and capture
+        ;; it, so a call the provider left in content is neither shown as prose
+        ;; nor lost — it is recovered at stream-end (see eca.llm-providers.dsml).
+        dsml-filter (dsml/make-filter)
+        raw-on-message-received on-message-received
+        on-message-received (fn [{:keys [type text] :as msg}]
+                              (if (and (= :text type) (string? text))
+                                (let [t ((:push! dsml-filter) text)]
+                                  (when (pos? (count t))
+                                    (raw-on-message-received {:type :text :text t})))
+                                (raw-on-message-received msg)))
+        flush-dsml-buffer! (fn []
+                             (when-let [t ((:finish! dsml-filter))]
+                               (when (pos? (count t))
+                                 (raw-on-message-received {:type :text :text t}))))
+        recover-dsml-tools! (fn []
+                              (when (empty? @tool-calls*)
+                                (let [blocks ((:blocks dsml-filter))
+                                      recovered (dsml/recover blocks)]
+                                  (doseq [[i {:keys [full-name arguments]}] (map-indexed vector recovered)]
+                                    (swap! tool-calls* assoc (str "dsml-" i)
+                                           {:index i
+                                            :id (new-internal-tool-call-id)
+                                            :full-name full-name
+                                            :arguments-text (json/generate-string arguments)
+                                            :stream-order i}))
+                                  ;; DSML was present but nothing parseable (usually a block
+                                  ;; truncated by max-tokens): do not swallow it silently.
+                                  (when (and (not (string/blank? blocks)) (empty? recovered))
+                                    (on-message-received
+                                     {:type :tool-call-dropped
+                                      :text "The model emitted a DSML tool call that could not be parsed (it may have been truncated); the call was dropped."})))))
         flush-content-buffer (fn []
                                (let [state @reasoning-state*
                                      buf (:buffer state)]
@@ -658,6 +713,7 @@
                                    (swap! reasoning-state* assoc :buffer ""))))
         wrapped-on-error (fn [error-data]
                            (flush-content-buffer)
+                           (flush-dsml-buffer!)
                            (finish-reasoning! reasoning-state* on-reason)
                            (on-error error-data))
         start-delta-reasoning (fn []
@@ -706,14 +762,26 @@
 
         handle-response (fn handle-response [event data tool-calls*]
                           (if (= event "stream-end")
-                            (let [had-tool-calls? (seq @tool-calls*)]
-                              ;; Flush any leftover buffered content and finish reasoning if needed
-                              (flush-content-buffer)
+                            (let [_ (flush-content-buffer)
+                                  _ (flush-dsml-buffer!)
+                                  _ (recover-dsml-tools!)
+                                  had-tool-calls? (seq @tool-calls*)]
                               (finish-reasoning! reasoning-state* on-reason)
                               (if had-tool-calls?
-                                (when (nil? (execute-accumulated-tools! tool-calls* on-tools-called-wrapper on-tools-called handle-response))
-                                  ;; No executable tools (e.g. invalid JSON args): finish so the UI does not hang.
-                                  (on-message-received {:type :finish :finish-reason "stop"}))
+                                (if (nil? (execute-accumulated-tools! tool-calls* on-tools-called-wrapper on-tools-called handle-response))
+                                  ;; Tool call(s) arrived but NONE were executable (invalid or
+                                  ;; truncated JSON arguments). A silent `finish "stop"` is
+                                  ;; indistinguishable from the model simply answering, so
+                                  ;; surface the dropped call(s) before finishing.
+                                  (do
+                                    (on-message-received
+                                     {:type :tool-call-dropped
+                                      :text (let [names (->> (vals @tool-calls*) (map :full-name) (remove nil?) distinct)]
+                                              (str "The model emitted " (count names)
+                                                   " tool call(s) that could not be executed (invalid arguments) and were dropped"
+                                                   (when (seq names) (str ": " (string/join ", " names))) "."))})
+                                    (on-message-received {:type :finish :finish-reason "stop"}))
+                                  nil)
                                 (when-let [finish-reason (:finish-reason data)]
                                   (when (not= finish-reason "tool_calls")
                                     (on-message-received {:type :finish :finish-reason finish-reason})))))

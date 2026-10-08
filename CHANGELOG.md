@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Recover DeepSeek DSML tool calls (`<｜tool_calls>` blocks containing `<｜invoke name=…>` / `<｜parameter … string=…>`) returned inside assistant content instead of the structured `tool_calls` field, so V4/V4.1 (incl. V4.1-Flash) tool calling works behind a serving stack that does not translate DSML; a tool call that still cannot be executed is now surfaced instead of ending the turn as a silent `stop`.
 - Add subagent `timeoutSeconds`; on timeout or max steps the subagent gets a final no-tools turn to report findings, and a parent stop keeps its partial output. #625
 - Fix tool-call continuations sending the provider `key` resolved at prompt start, so a `${cmd:...}` key that prints a short-lived token no longer expires mid-prompt; continuations read the key from the current config. #634
 

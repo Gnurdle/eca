@@ -1285,6 +1285,8 @@
                                                                    " Try rephrasing or switching to a different model.")})
                                                       (swap! db* update-in [:chats chat-id] dissoc :auto-compacting? :compacting?)
                                                       (lifecycle/finish-chat-prompt-stopped! :idle chat-ctx))
+                                         :tool-call-dropped (lifecycle/send-content! chat-ctx :system
+                                                                                      {:type :text :text (:text msg)})
                                          :finish (let [response-text @received-msgs*
                                                        stopping? (identical? :stopping (get-in @db* [:chats chat-id :status]))]
                                                    (when-not (string/blank? response-text)
