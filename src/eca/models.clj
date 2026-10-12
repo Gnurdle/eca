@@ -143,14 +143,29 @@
   [n]
   (when (and (number? n) (pos? n)) n))
 
+(def ^:private max-output-context-ratio
+  "Reject a catalog output limit claiming more than this fraction of the
+   model's context window: reserving it can never succeed on a real prompt,
+   because providers validate input + max-output <= context and every prompt
+   needs input room. models.dev reports output = 0.9 * context for a whole
+   family of models (e.g. `openrouter/deepseek/deepseek-v4.1-flash`: 943,718 of
+   1,048,576), so a guard that only rejects `output >= context` still lets a
+   *fresh* request 400 on arrival — the number is below the window but leaves
+   almost none of it for the input."
+  0.8)
+
 (defn ^:private sane-output-limit
-  "Return `output` unless it is >= `context`. Catalogs sometimes report a
-   model's max output tokens as a copy of its context window (e.g. models.dev
-   `openrouter/x-ai/grok-4.5` with 500k/500k); requesting that many output
-   tokens can never succeed since providers validate
-   input + max-output <= context, so treat such output limits as unknown."
+  "Return `output` unless reserving it is guaranteed to overflow the context
+   window — it is at/above `context`, or above `max-output-context-ratio` of it
+   (no realistic room left for input). Catalogs sometimes report a model's max
+   output tokens as a copy of its context window, or as 0.9 of it (models.dev
+   `openrouter/x-ai/grok-4.5` 500k/500k; `openrouter/deepseek/deepseek-v4.1-flash`
+   943k/1048k). Requesting that many output tokens can never succeed since
+   providers validate input + max-output <= context, so treat such output limits
+   as unknown and let the caller fall back to a sane default."
   [context output]
-  (when-not (and context output (>= output context))
+  (when-not (and context output
+                 (>= output (* context max-output-context-ratio)))
     output))
 
 (def ^:private models-with-image-generation-support

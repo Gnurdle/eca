@@ -1100,6 +1100,15 @@
   (testing "drops output >= context (request can never fit any input)"
     (is (nil? (#'models/sane-output-limit 500000 500000)))
     (is (nil? (#'models/sane-output-limit 500000 600000))))
+  (testing "drops output above 80% of context (no room left for input)"
+    ;; models.dev publishes output = 0.9 * context for several models; reserving
+    ;; it makes a fresh request exceed the window before any input is added.
+    (is (nil? (#'models/sane-output-limit 1048576 943718)))
+    (is (nil? (#'models/sane-output-limit 500000 450000)))
+    ;; the ratio is an inclusive ceiling
+    (is (nil? (#'models/sane-output-limit 500000 400000))))
+  (testing "keeps output below 80% of context"
+    (is (= 399000 (#'models/sane-output-limit 500000 399000))))
   (testing "keeps output when context is unknown"
     (is (= 8192 (#'models/sane-output-limit nil 8192))))
   (testing "nil output stays nil"
@@ -1108,6 +1117,7 @@
 (deftest all-sanitizes-catalog-output-limit-test
   (let [models-dev-data {"openrouter" {"api" "https://openrouter.ai/api/v1"
                                        "models" {"x-ai/grok-4.5" {"limit" {"context" 500000 "output" 500000}}
+                                                 "deepseek/deepseek-v4.1-flash" {"limit" {"context" 1048576 "output" 943718}}
                                                  "sane/model" {"limit" {"context" 200000 "output" 32000}}
                                                  "no-context/model" {"limit" {"output" 8192}}}}}
         known (#'models/all models-dev-data)]
@@ -1115,6 +1125,10 @@
       (is (nil? (get-in known ["openrouter/x-ai/grok-4.5" :limit :output])))
       (is (= 500000 (get-in known ["openrouter/x-ai/grok-4.5" :limit :context])))
       (is (nil? (get-in known ["openrouter/x-ai/grok-4.5" :max-output-tokens]))))
+    (testing "catalog output at 0.9 * context is treated as unknown (the reported model)"
+      (is (nil? (get-in known ["openrouter/deepseek/deepseek-v4.1-flash" :limit :output])))
+      (is (= 1048576 (get-in known ["openrouter/deepseek/deepseek-v4.1-flash" :limit :context])))
+      (is (nil? (get-in known ["openrouter/deepseek/deepseek-v4.1-flash" :max-output-tokens]))))
     (testing "output < context is kept"
       (is (= {:context 200000 :output 32000} (get-in known ["openrouter/sane/model" :limit])))
       (is (= 32000 (get-in known ["openrouter/sane/model" :max-output-tokens]))))
