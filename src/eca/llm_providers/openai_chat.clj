@@ -689,6 +689,14 @@
                               (when (empty? @tool-calls*)
                                 (let [blocks ((:blocks dsml-filter))
                                       recovered (dsml/recover blocks)]
+                                  ;; Recovery is otherwise INVISIBLE: a call rescued from
+                                  ;; content looks identical to one the provider sent
+                                  ;; structurally, so "did DSML handling run at all, and on
+                                  ;; what?" cannot be answered from the log. Say it out loud.
+                                  (when (seq recovered)
+                                    (logger/warn (str "DSML: recovered " (count recovered)
+                                                      " tool call(s) from content: "
+                                                      (string/join ", " (map :full-name recovered)))))
                                   (doseq [[i {:keys [full-name arguments]}] (map-indexed vector recovered)]
                                     (swap! tool-calls* assoc (str "dsml-" i)
                                            {:index i
